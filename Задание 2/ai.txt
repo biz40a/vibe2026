@@ -1,0 +1,3 @@
+Запрос был:
+"Расширь index.js на Node.js: добавь endpoint DELETE /delete/:id, удаляющий запись из MySQL по id, а в client.js
+после кнопки 'Remove' делай fetch DELETE и перерисовывай список. index.html и client.js должны быть синхронизированы с GET /list, POST /add, DELETE /delete/:id."
