@@ -2,135 +2,370 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2/promise');
+const url = require('url');
+const querystring = require('querystring');
+const bcrypt = require('bcrypt');
+const cookie = require('cookie');
+const crypto = require('crypto');
 
 const PORT = 3000;
+
 const dbConfig = {
-  host: 'localhost',
-  user: 'root',
-  password: '1310',
-  database: 'todolist'
+    host: 'localhost',
+    user: 'todo_user',
+    password: '1234',
+    database: 'todolist',
 };
 
-// Функция для получения списка из БД
-async function retrieveListItems() {
-  const conn = await mysql.createConnection(dbConfig);
-  const [rows] = await conn.execute('SELECT id, text FROM items ORDER BY id');
-  await conn.end();
-  return rows; // массив {id, text}
-}
+// Сессионное хранилище
+const sessions = {};
 
-// Endpoint GET /list → возвращаем JSON-массив
-async function handleList(req, res) {
-  try {
-    const todoItems = await retrieveListItems();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(todoItems));
-  } catch (err) {
-    console.error(err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'DB error' }));
-  }
-}
+// Middleware для проверки аутентификации
+function checkAuth(req) {
+    const cookies = cookie.parse(req.headers.cookie || '');
+    const sessionId = cookies.sessionId;
 
-// Endpoint POST /add → принимает JSON { text }, вставляет в БД
-async function handleAdd(req, res) {
-  try {
-    let body = '';
-    for await (const chunk of req) {
-      body += chunk;
+    if (!sessionId || !sessions[sessionId]) {
+        return null;
     }
-    const { text } = JSON.parse(body);
-    if (!text || typeof text !== 'string') {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Invalid text' }));
-      return;
+
+    return sessions[sessionId].userId;
+}
+
+// Функции для работы с пользователями
+async function createUser(username, password) {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const connection = await mysql.createConnection(dbConfig);
+    const query = 'INSERT INTO users (username, password_hash) VALUES (?, ?)';
+    const [result] = await connection.execute(query, [username, hashedPassword]);
+    await connection.end();
+    return result.insertId;
+}
+
+async function verifyUser(username, password) {
+    const connection = await mysql.createConnection(dbConfig);
+    const query = 'SELECT id, password_hash FROM users WHERE username = ?';
+    const [rows] = await connection.execute(query, [username]);
+    await connection.end();
+
+    if (rows.length === 0) {
+        return null;
     }
-    const conn = await mysql.createConnection(dbConfig);
-    await conn.execute('INSERT INTO items (text) VALUES (?)', [text]);
-    await conn.end();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true }));
-  } catch (err) {
-    console.error(err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'DB insert error' }));
-  }
+
+    const user = rows[0];
+    const isValid = await bcrypt.compare(password, user.password_hash);
+
+    return isValid ? user.id : null;
 }
 
-// Основной обработчик запросов
-async function handleRequest(req, res) {
-  if (await handleStaticFile(req, res)) return;
-
-  if (req.method === 'GET' && req.url === '/list') {
-    await handleList(req, res);
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/add') {
-    await handleAdd(req, res);
-    return;
-  }
-
-  if (req.method === 'DELETE' && req.url.startsWith('/delete/')) {
-  try {
-    const id = req.url.split('/')[2]; // получаем id из пути
-    const conn = await mysql.createConnection(dbConfig);
-    await conn.execute('DELETE FROM items WHERE id = ?', [id]);
-    await conn.end();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true }));
-  } catch (err) {
-    console.error(err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'DB delete error' }));
-  }
-  return;
-}
-
-  if (req.method === 'GET' && req.url === '/') {
+// Функции для работы с задачами
+async function retrieveListItems(userId) {
     try {
-      const html = await fs.promises.readFile(path.join(__dirname, 'index.html'), 'utf8');
-      // Сразу отрендерим пустые {{rows}} или не используем рендеринг сервер‐шаблона,
-      // так как клиентская часть будет подтягивать через AJAX
-      const processedHtml = html.replace('{{rows}}', '');
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(processedHtml);
-    } catch (err) {
-      console.error(err);
-      res.writeHead(500, { 'Content-Type': 'text/plain' });
-      res.end('Error loading index.html');
+        const connection = await mysql.createConnection(dbConfig);
+        const query = 'SELECT id, text FROM items WHERE user_id = ? ORDER BY id';
+        const [rows] = await connection.execute(query, [userId]);
+        await connection.end();
+        return rows;
+    } catch (error) {
+        console.error('Error retrieving list items:', error);
+        throw error;
     }
-    return;
-  }
+}
 
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end('Route not found');
+async function addItemToDB(text, userId) {
+    try {
+        const connection = await mysql.createConnection(dbConfig);
+        const query = 'INSERT INTO items (text, user_id) VALUES (?, ?)';
+        const [result] = await connection.execute(query, [text, userId]);
+        await connection.end();
+        return result.insertId;
+    } catch (error) {
+        console.error('Error adding item:', error);
+        throw error;
+    }
+}
+
+async function deleteItemFromDB(id, userId) {
+    try {
+        const connection = await mysql.createConnection(dbConfig);
+        const query = 'DELETE FROM items WHERE id = ? AND user_id = ?';
+        const [result] = await connection.execute(query, [id, userId]);
+        await connection.end();
+        return result.affectedRows > 0;
+    } catch (error) {
+        console.error('Error deleting item:', error);
+        throw error;
+    }
+}
+
+async function updateItemInDB(id, newText, userId) {
+    try {
+        const connection = await mysql.createConnection(dbConfig);
+        const query = 'UPDATE items SET text = ? WHERE id = ? AND user_id = ?';
+        const [result] = await connection.execute(query, [newText, id, userId]);
+        await connection.end();
+        return result.affectedRows > 0;
+    } catch (error) {
+        console.error('Error updating item:', error);
+        throw error;
+    }
+}
+
+async function getHtmlRows(userId) {
+    const todoItems = await retrieveListItems(userId);
+    return todoItems.map(item => `
+    <tr data-id="${item.id}">
+    <td>${item.id}</td>
+    <td class="item-text">${item.text}</td>
+    <td>
+    <button class="edit-btn">Edit</button>
+    <button class="delete-btn" data-id="${item.id}">×</button>
+    </td>
+    </tr>
+    `).join('');
+}
+
+async function serveLoginPage(res, error = null) {
+    try {
+        let html = await fs.promises.readFile(path.join(__dirname, 'login.html'), 'utf8');
+        if (error) {
+            html = html.replace('<!-- ERROR_PLACEHOLDER -->',
+                                '<div class="error">Invalid username or password</div>');
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        return res.end(html);
+    } catch (err) {
+        console.error(err);
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        return res.end('Error loading login page');
+    }
+}
+
+async function serveRegisterPage(res, error = null) {
+    try {
+        let html = await fs.promises.readFile(path.join(__dirname, 'register.html'), 'utf8');
+        if (error) {
+            html = html.replace('<!-- ERROR_PLACEHOLDER -->',
+                                '<div class="error">Registration failed. Username may be taken.</div>');
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        return res.end(html);
+    } catch (err) {
+        console.error(err);
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        return res.end('Error loading register page');
+    }
+}
+
+async function handleRequest(req, res) {
+    const parsedUrl = url.parse(req.url, true);
+
+    // Обработка статических файлов
+    if (req.method === 'GET' && parsedUrl.pathname === '/styles.css') {
+        try {
+            const css = await fs.promises.readFile(path.join(__dirname, 'styles.css'), 'utf8');
+            res.writeHead(200, { 'Content-Type': 'text/css' });
+            return res.end(css);
+        } catch (err) {
+            res.writeHead(404);
+            return res.end();
+        }
+    }
+
+    // Обработка маршрутов аутентификации
+    if (req.method === 'GET' && parsedUrl.pathname === '/login') {
+        return serveLoginPage(res, parsedUrl.query.error);
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/login') {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', async () => {
+            const { username, password } = querystring.parse(body);
+
+            try {
+                const userId = await verifyUser(username, password);
+                if (userId) {
+                    const sessionId = crypto.randomBytes(16).toString('hex');
+                    sessions[sessionId] = { userId };
+
+                    res.writeHead(302, {
+                        'Location': '/',
+                        'Set-Cookie': cookie.serialize('sessionId', sessionId, {
+                            httpOnly: true,
+                            maxAge: 60 * 60 * 24 * 7 // 1 week
+                        })
+                    });
+                    return res.end();
+                } else {
+                    res.writeHead(302, { 'Location': '/login?error=1' });
+                    return res.end();
+                }
+            } catch (error) {
+                console.error(error);
+                res.writeHead(500, { 'Content-Type': 'text/plain' });
+                return res.end('Login error');
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'GET' && parsedUrl.pathname === '/register') {
+        return serveRegisterPage(res, parsedUrl.query.error);
+    }
+
+    if (req.method === 'POST' && parsedUrl.pathname === '/register') {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', async () => {
+            const { username, password } = querystring.parse(body);
+
+            try {
+                await createUser(username, password);
+                res.writeHead(302, { 'Location': '/login' });
+                return res.end();
+            } catch (error) {
+                console.error(error);
+                res.writeHead(302, { 'Location': '/register?error=1' });
+                return res.end();
+            }
+        });
+        return;
+    }
+
+    if (req.method === 'GET' && parsedUrl.pathname === '/logout') {
+        const cookies = cookie.parse(req.headers.cookie || '');
+        const sessionId = cookies.sessionId;
+
+        if (sessionId && sessions[sessionId]) {
+            delete sessions[sessionId];
+        }
+
+        res.writeHead(302, {
+            'Location': '/login',
+            'Set-Cookie': cookie.serialize('sessionId', '', {
+                httpOnly: true,
+                expires: new Date(0)
+            })
+        });
+        return res.end();
+    }
+
+    // Проверка аутентификации для защищенных маршрутов
+    const userId = await checkAuth(req);
+
+    if (!userId && parsedUrl.pathname !== '/login' && parsedUrl.pathname !== '/register') {
+        res.writeHead(302, { 'Location': '/login' });
+        return res.end();
+    }
+
+    // Новый endpoint для проверки привязки Telegram
+    if (req.method === 'GET' && parsedUrl.pathname === '/check-telegram') {
+        try {
+            const connection = await mysql.createConnection(dbConfig);
+            const query = 'SELECT telegram_id FROM users WHERE id = ?';
+            const [rows] = await connection.execute(query, [userId]);
+            await connection.end();
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ hasTelegram: !!rows[0]?.telegram_id }));
+        } catch (error) {
+            console.error(error);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'Database error' }));
+        }
+    }
+
+    // Обработка защищенных маршрутов
+    if (req.method === 'GET' && parsedUrl.pathname === '/') {
+        try {
+            const html = await fs.promises.readFile(path.join(__dirname, 'index.html'), 'utf8');
+            const processedHtml = html.replace('{{rows}}', await getHtmlRows(userId));
+
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            return res.end(processedHtml);
+        } catch (err) {
+            console.error(err);
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            return res.end('Error loading index.html');
+        }
+    }
+    else if (req.method === 'POST' && parsedUrl.pathname === '/add') {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', async () => {
+            const text = new URLSearchParams(body).get('text');
+            if (text && text.trim()) {
+                try {
+                    await addItemToDB(text.trim(), userId);
+                    res.writeHead(302, { 'Location': '/' });
+                    return res.end();
+                } catch (error) {
+                    console.error(error);
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    return res.end('Error adding item');
+                }
+            } else {
+                res.writeHead(400, { 'Content-Type': 'text/plain' });
+                return res.end('Invalid input');
+            }
+        });
+        return;
+    }
+    else if (req.method === 'POST' && parsedUrl.pathname === '/delete') {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', async () => {
+            const { id } = querystring.parse(body);
+            if (id) {
+                try {
+                    const success = await deleteItemFromDB(id, userId);
+                    if (success) {
+                        res.writeHead(302, { 'Location': '/' });
+                        return res.end();
+                    } else {
+                        res.writeHead(404, { 'Content-Type': 'text/plain' });
+                        return res.end('Item not found');
+                    }
+                } catch (error) {
+                    console.error(error);
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    return res.end('Error deleting item');
+                }
+            } else {
+                res.writeHead(400, { 'Content-Type': 'text/plain' });
+                return res.end('Invalid ID');
+            }
+        });
+        return;
+    }
+    else if (req.method === 'POST' && parsedUrl.pathname === '/update') {
+        let body = '';
+        req.on('data', chunk => body += chunk.toString());
+        req.on('end', async () => {
+            const { id, text } = querystring.parse(body);
+            if (id && text && text.trim()) {
+                try {
+                    const success = await updateItemInDB(id, text.trim(), userId);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success }));
+                } catch (error) {
+                    console.error(error);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ success: false, error: 'Error updating item' }));
+                }
+            } else {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                return res.end(JSON.stringify({ success: false, error: 'Invalid input' }));
+            }
+        });
+        return;
+    }
+    else {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        return res.end('Not Found');
+    }
 }
 
 const server = http.createServer(handleRequest);
-
-const url = require('url');
-
-// Отдача статических файлов (client.js, стили и т.д.)
-async function handleStaticFile(req, res) {
-  const parsedUrl = url.parse(req.url);
-  const safePath = path.normalize(parsedUrl.pathname).replace(/^(\.\.[\/\\])+/, '');
-  const filePath = path.join(__dirname, safePath);
-
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-    const fileStream = fs.createReadStream(filePath);
-    res.writeHead(200, { 'Content-Type': getContentType(filePath) });
-    fileStream.pipe(res);
-    return true; // файл найден и отдан
-  }
-  return false; // не файл
-}
-
-function getContentType(filePath) {
-  if (filePath.endsWith('.js')) return 'application/javascript';
-  if (filePath.endsWith('.css')) return 'text/css';
-  if (filePath.endsWith('.html')) return 'text/html';
-  return 'application/octet-stream';
-}
-
 server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
